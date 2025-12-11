@@ -140,51 +140,20 @@ class AtomAttentionEncoderDiffusion(nn.Module):
 
         @activation_checkpointing
         def embed_atom_feats(R_L, C_L, D_LL, V_LL, P_LL, tok_idx):
-            # Embed pairwise inverse squared distances, and the valid mask
-            if self.training:
-                if self.use_inv_dist_squared:
-                    P_LL = (
-                        P_LL
-                        + self.process_inverse_dist(
-                            1 / (1 + torch.sum(D_LL * D_LL, dim=-1, keepdim=True))
-                        )
-                        * V_LL
-                    )
-                else:
-                    P_LL = (
-                        P_LL
-                        + self.process_inverse_dist(
-                            1 / (1 + torch.linalg.norm(D_LL, dim=-1, keepdim=True))
-                        )
-                        * V_LL
-                    )
-                P_LL = P_LL + self.process_valid_mask(V_LL.to(P_LL.dtype)) * V_LL
-            else:
-                if self.use_inv_dist_squared:
-                    P_LL[V_LL[..., 0]] += self.process_inverse_dist(
-                        1
-                        / (
-                            1
-                            + torch.sum(
-                                D_LL[V_LL[..., 0]] * D_LL[V_LL[..., 0]],
-                                dim=-1,
-                                keepdim=True,
-                            )
-                        )
-                    )
-                else:
-                    P_LL[V_LL[..., 0]] += self.process_inverse_dist(
-                        1
-                        / (
-                            1
-                            + torch.linalg.norm(
-                                D_LL[V_LL[..., 0]], dim=-1, keepdim=True
-                            )
-                        )
-                    )
-                P_LL[V_LL[..., 0]] += self.process_valid_mask(
-                    V_LL[V_LL[..., 0]].to(P_LL.dtype)
+            # Embed pairwise inverse distances and valid-mask features without in-place updates
+            if self.use_inv_dist_squared:
+                inv_dist_features = self.process_inverse_dist(
+                    1 / (1 + torch.sum(D_LL * D_LL, dim=-1, keepdim=True))
                 )
+            else:
+                inv_dist_features = self.process_inverse_dist(
+                    1 / (1 + torch.linalg.norm(D_LL, dim=-1, keepdim=True))
+                )
+
+            valid_mask_features = self.process_valid_mask(V_LL.to(P_LL.dtype))
+
+            P_LL = P_LL + inv_dist_features * V_LL
+            P_LL = P_LL + valid_mask_features * V_LL
 
             # Initialise the atom single representation as the single conditioning.
             Q_L = C_L
@@ -528,14 +497,14 @@ class AttentionPairBiasDiffusion(nn.Module):
         attn = torch.einsum("...ihd,...jhd->...ijh", query_subset, key_subset)
         attn = attn / (self.c**0.5)
 
-        attn += B_IIH[:, indicesQ[:, :, None], indicesK[:, None, :]] - 1e9 * (
-            maskQ[None, :, :, None, None] + maskK[None, :, None, :, None]
-        )
+        bias = B_IIH[:, indicesQ[:, :, None], indicesK[:, None, :]]
+        penalty = 1e9 * (maskQ[None, :, :, None, None] + maskK[None, :, None, :, None])
+        attn = attn + bias - penalty
         attn = torch.softmax(attn, dim=-2)
 
         value_subset = V_IH[:, indicesK]
         atom_features = torch.einsum("...ijh,...jhc->...ihc", attn, value_subset)
-        atom_features = atom_features[:, ~maskQ]
+        atom_features = atom_features[:, ~maskQ].clone()
         atom_features = (G_IH * atom_features).view(D, L, -1)
         atom_features = self.to_a(atom_features.view(D, L, -1))
 
